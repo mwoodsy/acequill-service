@@ -26,14 +26,14 @@ function Watson(file, configs) {
     this.proxy_port = configs.proxy_port;
     this.contentType = "audio/wav; rate=16000";
     this.smart_formatting = true;
-};
+}
 
 Watson.prototype.start = function (callback) {
 
     var speechParams = {
         iam_apikey: this.iam_apikey,
         url: this.url
-    }
+    };
 
     if (this.proxy) {
         var tunnel = require('tunnel');
@@ -60,15 +60,20 @@ Watson.prototype.start = function (callback) {
         objectMode: true
     }).on('data', function (data) {
         console.log('In data handler');
-        var results = {
-            'transcript': data.results[0].alternatives[0].transcript,
-            'final': data.results[0].final,
-            'timestamp': new Date()
-        };
-        console.log('results:' + results);
-        callback(results);
+
+        if (data.results[0]) {
+            var results = {
+                'transcript': data.results[0].alternatives[0].transcript,
+                'final': data.results[0].final,
+                'timestamp': new Date()
+            };
+
+            console.log('results:' + results);
+            callback(results);
+        }
+
     }).on('open', function () {
-        console.log("Websocket to watson is open. Resume GrowingFile.")
+        console.log("Websocket to watson is open. Resume GrowingFile.");
         gf.resume();
     }).on('error', function (err) {
         console.log(err.toString());
@@ -91,7 +96,7 @@ Watson.prototype.start = function (callback) {
     }).on('end', () => {
         console.log('FILE HAS ENDED');
         recognizeStream.finish();
-    })
+    });
 
 };
 
