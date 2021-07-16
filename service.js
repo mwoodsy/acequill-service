@@ -1,82 +1,29 @@
-var asteriskManager = require('asterisk-manager');
-var asteriskConfigs = require('./config/asterisk');
-var watsonConfigs = require('./config/watson');
-var Watson = require('./transcription/watson');
-
-var wavFilePath = '/tmp/wav';
-
+const asteriskManager = require('asterisk-manager');
+const asteriskConfigs = require('./config/asterisk');
+//const STTEngine = require('./transcription/watson');
+const STTEngine = require('./transcription/google');
+const RedisManager = require('./utils/redisManager');
+const cleaner = require('./utils/cleaner');
+var wavFilePath = process.cwd() + '/recordings/';
+console.log(wavFilePath)
 var bridgeIdMap = new Map();
 var channelIdSet = new Set();
 var ami = null;
 var nconf = require('nconf');
 var fs = require('fs');
 
-// var MongoClient = require('mongodb').MongoClient;
-
-// Set the name of the config file
-var cfile = '../dat/config.json';
-
-// Validate the incoming JSON config file
-try {
-    var content = fs.readFileSync(cfile, 'utf8');
-    var myjson = JSON.parse(content);
-    console.log("Valid JSON config file");
-} catch (ex) {
-    console.log("");
-    console.log("*******************************************************");
-    console.log("Error! Malformed configuration file: " + cfile);
-    console.log('Exiting...');
-    console.log("*******************************************************");
-    console.log("");
-    process.exit(1);
-}
-
-nconf.file({
-    file: cfile
-});
-var configobj = JSON.parse(fs.readFileSync(cfile, 'utf8'));
-
 /*
 ** The presence of a populated cleartext field in config.json means that the file is in clear text
 ** remove the field or set it to "" if the file is encoded
 */
 var clearText = false;
-if (typeof (nconf.get('common:cleartext')) !== "undefined"   && nconf.get('common:cleartext') !== "" ) {
+if (typeof (nconf.get('common:cleartext')) !== "undefined" && nconf.get('common:cleartext') !== "") {
     console.log('clearText field is in config.json. assuming file is in clear text');
     clearText = true;
 }
 
-/*
-// Get all of the parameters for the MongoDB connection
-var dbName = getConfigVal('database_servers:mongodb:database_name');
-var collectionName = getConfigVal('database_servers:mongodb:caption_collection_name');
-var mongoUri = getConfigVal('database_servers:mongodb:connection_uri');
-var dbConnection;
-
-console.log("dbName:" + dbName);
-console.log("mongoUri:" + mongoUri);
-
-// Use connect method to connect to the server and create the collection
-MongoClient.connect(mongoUri, function(err, client) {
-    if(err){
-        console.log("ERROR CONNECTING TO MONGO SERVER. Exiting...");
-        process.exit(1);
-    }else{
-        console.log("Connected successfully to MongoDB server");
-
-        dbConnection = client.db(dbName);
-
-        dbConnection.createCollection(collectionName, function(err, res) {
-            if (err) {
-                console.log("Error Creating Mongo Collection: " + err);
-            }else{
-                console.log("Collection created!");
-            }
-        });
-    }
-});
-*/
-
+//Comment out if using IBM Watson
+process.env.GOOGLE_APPLICATION_CREDENTIALS = process.cwd() + "/config/google.json";
 
 /**
  * Creates an AMI connection to Asterisk.
@@ -102,8 +49,14 @@ function init_ami() {
     }
 }
 
+// Create Redis Client
+const rClient = new RedisManager();
 // Initialize the Asterisk AMI connection
 init_ami();
+
+setInterval(function(){
+	cleaner(wavFilePath);
+},5000);
 
 
 /**
@@ -172,26 +125,31 @@ function handle_manager_event(evt) {
 
                 console.log("bridgeIdMap.size - after: " + bridgeIdMap.size);
 
-                var wavFilename = wavFilePath + bridgeId;
+                var wavFilename = wavFilePath +  bridgeId;
 
                 console.log("Adding " + agentChannel + " to set");
                 channelIdSet.add(agentChannel);
 
                 // Start recording here
-                console.log("Recording file: " + wavFilename);
-                sendAmiAction({
-                    "Action": "Monitor",
-                    "Channel": agentChannel,
-                    "File": wavFilename,
-                    "Format": "wav16"
-                });
+                console.log("Recording file: " + wavFilePath + wavFilename);
+
+                var mixMonitorCommand = {
+                    Action: "MixMonitor",
+                    Channel: evt.channel,
+                    File: wavFilename + "-mix.wav16",
+                    options: "r(" + wavFilename + "-callee-out.wav16) t(" + wavFilename + "-caller-out.wav16)"
+                };
+
+                sendAmiAction(mixMonitorCommand);
+
+
 
                 /*
                  * Build the filenames to pass out to startTransciption, Asterisk appends the
                  * -in.wav16 and -out.wav16 extensions to the files is creates
                  */
-                var inFile = wavFilePath + bridgeId + "-in.wav16";
-                var outFile = wavFilePath + bridgeId + "-out.wav16";
+                var inFile =  wavFilename + "-caller-out.wav16";
+                var outFile = wavFilename + "-callee-out.wav16";
 
                 console.log();
                 console.log("inFile: " + inFile);
@@ -203,10 +161,16 @@ function handle_manager_event(evt) {
                 // Start the transcription for each channel
                 // Test if extension is webrtc (30000 or 90000)
                 const webrtcExt = new RegExp("PJSIP\/(3|9)");
-                if(webrtcExt.test(consumerChannel))
-                        startTranscription(inFile, consumerChannel, evt.uniqueid);
-                if(webrtcExt.test(agentChannel))
-                        startTranscription(outFile, agentChannel, evt.uniqueid);
+                if (webrtcExt.test(consumerChannel)) {
+                    rClient.getLanguageByExtension(agentChannel.substring(6, 11), function (langCd) {
+                        startTranscription(inFile, consumerChannel, evt.uniqueid, langCd);
+                    });
+                }
+                if (webrtcExt.test(agentChannel)) {
+                    rClient.getLanguageByExtension(consumerChannel.substring(6, 11), function (langCd) {
+                        startTranscription(outFile, agentChannel, evt.uniqueid, langCd);
+                    });
+                }
             }
             break;
 
@@ -241,13 +205,13 @@ function handle_manager_event(evt) {
  * @param {string} wavFile - Name of the WAV file being populated.
  * @param {string} channel - Asterisk channel corresponding to this leg of the call.
  */
-function startTranscription(wavFile, channel, callid) {
+function startTranscription(wavFile, channel, callid, langCd) {
 
     console.log("Entering startTranscription - wavFile: " + wavFile);
 
     try {
         var sttEngineMsgTime = 0;
-        var sttEngine = new Watson(wavFile, watsonConfigs);
+        var sttEngine = new STTEngine(wavFile, langCd);
 
         sttEngine.start(function (data) {
 
@@ -255,7 +219,7 @@ function startTranscription(wavFile, channel, callid) {
                 let d = new Date();
                 sttEngineMsgTime = d.getTime();
             }
-
+            data.langCd = langCd;
             data.msgid = sttEngineMsgTime;
 
             console.log("data.msgid: " + data.msgid);
@@ -270,14 +234,7 @@ function startTranscription(wavFile, channel, callid) {
                 });
 
                 data.channel = channel;
-		        data.callid = callid;
-
-                /*
-                dbConnection.collection(collectionName).insertOne(data, function(err, res) {
-                    if (err) console.log("Mongo Error on Insert");
-                    //console.log("1 document inserted into the captions collection");
-                });
-                */
+                data.callid = callid;
 
             }
 
@@ -303,7 +260,7 @@ function sendAmiAction(obj) {
     console.log();
     console.log("Entering sendAmiAction(): " + JSON.stringify(obj, null, 4));
 
-    ami.action(obj, function(err, res) {
+    ami.action(obj, function (err, res) {
         if (err) {
             console.log('AMI Action error ' + JSON.stringify(err, null, 4));
         }
@@ -320,25 +277,25 @@ function getConfigVal(param_name) {
     var decodedString = null;
 
     if (typeof val !== 'undefined' && val !== null) {
-      //found value for param_name
+        //found value for param_name
 
 
-      if (clearText) {
+        if (clearText) {
 
-        decodedString = val;
-      } else {
-        decodedString = new Buffer(val, 'base64');
-      }
+            decodedString = val;
+        } else {
+            decodedString = new Buffer(val, 'base64');
+        }
     } else {
-      //did not find value for param_name
-      /*
-      logger.error('');
-      logger.error('*******************************************************');
-      logger.error('ERROR!!! Config parameter is missing: ' + param_name);
-      logger.error('*******************************************************');
-      logger.error('');
-      */
-      decodedString = "";
+        //did not find value for param_name
+        /*
+        logger.error('');
+        logger.error('*******************************************************');
+        logger.error('ERROR!!! Config parameter is missing: ' + param_name);
+        logger.error('*******************************************************');
+        logger.error('');
+        */
+        decodedString = "";
     }
     return (decodedString.toString());
-  }
+}
